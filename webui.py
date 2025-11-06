@@ -469,7 +469,7 @@ if __name__ == "__main__":
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR, exist_ok=True)
-    model_downlod()
+
     ui = create_ui()
     if args.listen:
         ui.queue().launch(share=False, server_name="0.0.0.0", server_port=args.port)
