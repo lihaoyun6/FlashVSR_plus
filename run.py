@@ -7,6 +7,7 @@ import argparse
 parser = argparse.ArgumentParser(description="FlashVSR+: Towards Real-Time Diffusion-Based Streaming Video Super-Resolution.")
 parser.add_argument("-i", "--input", type=str, help="Path to video file or folder of images")
 parser.add_argument("-s", "--scale", type=int, default=4, help="Upscale factor, default=4")
+parser.add_argument("-v", "--version", type=str, default="10", choices=["10", "11"], help="Model version, default=10")
 parser.add_argument("-m", "--mode", type=str, default="tiny", choices=["tiny", "tiny-long", "full"], help="The type of pipeline to use, default=tiny")
 parser.add_argument("--tiled-vae", action="store_true", help="Enable tile decoding")
 parser.add_argument("--tiled-dit", action="store_true", help="Enable tile inference")
@@ -56,14 +57,14 @@ from huggingface_hub import snapshot_download
 from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
 from src.models import wan_video_dit
 from src.models.TCDecoder import build_tcdecoder
-from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj
+from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
 
 root = os.path.dirname(os.path.abspath(__file__))
 temp = os.path.join(root, "_temp")
 devices = get_device_list()
 
 def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
-    model_dir = os.path.join(root, "models", "FlashVSR")
+    model_dir = os.path.join(root, "models", model_name.split("/")[-1])
     if not os.path.exists(model_dir):
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info')
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
@@ -96,6 +97,9 @@ def list_images_natural(folder: str):
 
 def largest_8n1_leq(n):  # 8n+1
     return 0 if n < 1 else ((n - 1)//8)*8 + 1
+
+def next_8n5(n):  # next 8n+5
+    return 21 if n < 21 else ((n - 5 + 7) // 8) * 8 + 5
 
 def is_video(path): 
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
@@ -438,9 +442,13 @@ def stitch_video_tiles(
             except OSError as e:
                 log(f"Could not remove temporary file '{path}': {e}", message_type='warning')
 
-def init_pipeline(mode, device, dtype):
-    model_downlod()
-    model_path = os.path.join(root, "models", "FlashVSR")
+def init_pipeline(version, mode, device, dtype):
+    if version == "10":
+        model = "FlashVSR"
+    else:
+        model = "FlashVSR-v1.1"
+    model_downlod(model_name="JunhaoZhuang/" + model)
+    model_path = os.path.join(root, "models", model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist! Please save all weights to "{model_path}"')
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
@@ -474,9 +482,11 @@ def init_pipeline(mode, device, dtype):
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
         pipe.TCDecoder.clean_mem()
         
-    pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
-    if os.path.exists(lq_path):
-        pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu"), strict=True)
+    if model == "FlashVSR":
+        pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
+    else:
+        pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
+    pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu"), strict=True)
     pipe.denoising_model().LQ_proj_in.to(device)
     pipe.to(device, dtype=dtype)
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
@@ -485,10 +495,10 @@ def init_pipeline(mode, device, dtype):
     
     return pipe
 
-def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None):
+def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None):
     _device = device
     if device == "auto":
-        _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else device
+        _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
     if _device == "auto" or _device not in devices:
         raise RuntimeError("No devices found to run FlashVSR!")
     if _device.startswith("cuda"):
@@ -497,11 +507,16 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
     if tiled_dit and (tile_overlap > tile_size / 2):
         raise ValueError('The "tile_overlap" must be less than half of "tile_size"!')
     
-    frames, fps = prepare_tensors(input, dtype=dtype)
+    _frames, fps = prepare_tensors(input, dtype=dtype)
     _fps = fps if is_video(input) else args.fps
     
-    if frames.shape[0] < 21:
-        raise ValueError(f"Number of frames must be at least 21, got {frames.shape[0]}")
+    add = next_8n5(_frames.shape[0]) - _frames.shape[0]
+    padding_frames = _frames[-1:, :, :, :].repeat(add, 1, 1, 1)
+    frames = torch.cat([frames, padding_frames], dim=0)
+    frame_count = _frames.shape[0]
+    del _frames
+    clean_vram()
+    
     log("[FlashVSR] Preparing frames...", message_type="finish")
     
     if tiled_dit:
@@ -514,7 +529,7 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
         else:
             final_output_canvas = torch.zeros(
                 (num_aligned_frames, H * scale, W * scale, C), 
-                dtype=torch.float32, 
+                dtype=dtype, 
                 device="cpu"
             )
             weight_sum_canvas = torch.zeros_like(final_output_canvas)
@@ -523,7 +538,7 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
         latent_tiles_cpu = []
         temp_videos = []
         
-        pipe = init_pipeline(mode, _device, dtype)
+        pipe = init_pipeline(version, mode, _device, dtype)
         
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
             input_tile = frames[:, y1:y2, x1:x2, :]
@@ -537,7 +552,7 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
                 LQ_tile = LQ_tile.to(_device)
             
             if i == 0:
-                log(f"[FlashVSR] Processing {frames.shape[0]} frames...", message_type='info')
+                log(f"[FlashVSR] Processing {frame_count} frames...", message_type='info')
             log(f"[FlashVSR] Processing tile {i+1}/{len(tile_coords)}: ({x1},{y1}) to ({x2},{y2})", message_type='info')
             
             output_tile_gpu = pipe(
@@ -588,8 +603,8 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
             LQ, th, tw, F = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype)
             LQ = LQ.to(_device)
 
-        pipe = init_pipeline(mode, _device, dtype)
-        log(f"[FlashVSR] Processing {frames.shape[0]} frames...", message_type='info')
+        pipe = init_pipeline(version, mode, _device, dtype)
+        log(f"[FlashVSR] Processing {frame_count} frames...", message_type='info')
         video = pipe(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
@@ -607,7 +622,7 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
         del pipe, video, LQ
         clean_vram()
     
-    return final_output, fps
+    return final_output[:frame_count, :, :, :], fps
 
 if __name__ == "__main__":
     dtype_map = {
@@ -625,13 +640,12 @@ if __name__ == "__main__":
     else:
         wan_video_dit.USE_BLOCK_ATTN = True
     
-    model_downlod()
     if os.path.exists(temp):
         shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
     name = os.path.basename(args.input.rstrip('/'))
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
-    result, fps = main(args.input, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
+    result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final)
     if args.mode != "tiny-long":
         save_video(result, final, fps=fps, quality=args.quality)

@@ -26,7 +26,7 @@ from huggingface_hub import snapshot_download
 from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
 from src.models import wan_video_dit
 from src.models.TCDecoder import build_tcdecoder
-from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj
+from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(ROOT_DIR, "outputs")
@@ -50,7 +50,7 @@ def dummy_tqdm(iterable, *args, **kwargs):
     return iterable
 
 def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
-    model_dir = os.path.join(ROOT_DIR, "models", "FlashVSR")
+    model_dir = os.path.join(ROOT_DIR, "models",  model_name.split("/")[-1])
     if not os.path.exists(model_dir):
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info')
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
@@ -72,6 +72,9 @@ def list_images_natural(folder: str):
 
 def largest_8n1_leq(n):
     return 0 if n < 1 else ((n - 1)//8)*8 + 1
+
+def next_8n5(n):  # next 8n+5
+    return 21 if n < 21 else ((n - 5 + 7) // 8) * 8 + 5
 
 def is_video(path): 
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
@@ -246,9 +249,9 @@ def stitch_video_tiles(
             except OSError as e:
                 log(f"Could not remove temporary file '{path}': {e}", message_type='warning')
 
-def init_pipeline(mode, device, dtype):
-    model_downlod()
-    model_path = os.path.join(ROOT_DIR, "models", "FlashVSR")
+def init_pipeline(model, mode, device, dtype):
+    model_downlod(model_name="JunhaoZhuang/"+model)
+    model_path = os.path.join(ROOT_DIR, "models", model)
     ckpt_path, vae_path, lq_path, tcd_path, prompt_path = [os.path.join(model_path, f) for f in ["diffusion_pytorch_model_streaming_dmd.safetensors", "Wan2.1_VAE.pth", "LQ_proj_in.ckpt", "TCDecoder.ckpt", "../posi_prompt.pth"]]
     mm = ModelManager(torch_dtype=dtype, device="cpu")
     if mode == "full":
@@ -257,14 +260,18 @@ def init_pipeline(mode, device, dtype):
         mm.load_models([ckpt_path]); pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device) if mode == "tiny" else FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
         pipe.TCDecoder = build_tcdecoder(new_channels=[512, 256, 128, 128], device=device, dtype=dtype, new_latent_channels=16+768)
         pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False); pipe.TCDecoder.clean_mem()
-    pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
+    if model == "FlashVSR":
+        pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
+    else:
+        pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
     if os.path.exists(lq_path): pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu"), strict=True)
     pipe.to(device, dtype=dtype); pipe.enable_vram_management(); pipe.init_cross_kv(prompt_path=prompt_path); pipe.load_models_to_device(["dit", "vae"])
     return pipe
 
-# --- 集成化的核心逻辑函数 (更新版) ---
+# --- Integrated core logic function (Updated Version) ---
 def run_flashvsr_integrated(
     input_path, 
+    model,
     mode, 
     scale, 
     color_fix, 
@@ -279,51 +286,56 @@ def run_flashvsr_integrated(
     fps_override,
     quality,
     attention_mode,
-    sparse_ratio, # 新增
-    kv_ratio,     # 新增
-    local_range,  # 新增
+    sparse_ratio, # New
+    kv_ratio,     # New
+    local_range,  # New
     progress=gr.Progress(track_tqdm=True)
 ):
-    if not input_path: raise gr.Error("请提供输入视频或图片文件夹路径！")
+    if not input_path: raise gr.Error("Please provide an input video or image folder path!")
     if seed == -1: seed = random.randint(0, 2**32 - 1)
     
-    # --- 参数准备 ---
+    # --- Parameter Preparation ---
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}; dtype = dtype_map.get(dtype_str, torch.bfloat16)
     devices = get_device_list(); _device = device
-    if device == "auto": _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
-    if _device not in devices and _device != "cpu": raise gr.Error(f"设备 '{_device}' 不可用! 可用设备: {devices}")
+    if device == "auto": _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    if _device not in devices and _device != "cpu": raise gr.Error(f"Device '{_device}' is not available! Available devices: {devices}")
     if _device.startswith("cuda"): torch.cuda.set_device(_device)
-    if tiled_dit and (tile_overlap > tile_size / 2): raise gr.Error("重叠区域 (overlap) 必须小于分块大小 (tile_size) 的一半！")
+    if tiled_dit and (tile_overlap > tile_size / 2): raise gr.Error("Overlap must be less than half of the tile size!")
     wan_video_dit.USE_BLOCK_ATTN = (attention_mode == "block")
-
-    # --- 输出路径 ---
+    
+    # --- Output Path ---
     input_basename = os.path.splitext(os.path.basename(input_path))[0]
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     output_filename = f"{input_basename}_{mode}_s{scale}_{timestamp}.mp4"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
-
-    # --- 核心逻辑 ---
-    progress(0, desc="正在加载视频帧...")
-    log(f"正在从 {input_path} 加载帧...", message_type='info')
-    frames, original_fps = prepare_tensors(input_path, dtype=dtype)
+    
+    # --- Core Logic ---
+    progress(0, desc="Loading video frames...")
+    log(f"Loading frames from {input_path}...", message_type='info')
+    _frames, original_fps = prepare_tensors(input_path, dtype=dtype)
     _fps = original_fps if is_video(input_path) else fps_override
-    if frames.shape[0] < 21: raise gr.Error(f"输入帧数必须至少为21帧，当前为 {frames.shape[0]} 帧")
-    log("视频帧加载完成。", message_type="finish")
+    add = next_8n5(_frames.shape[0]) - _frames.shape[0]
+    padding_frames = _frames[-1:, :, :, :].repeat(add, 1, 1, 1)
+    frames = torch.cat([frames, padding_frames], dim=0)
+    frame_count = _frames.shape[0]
+    del _frames
+    clean_vram()
+    log("Video frames loaded successfully.", message_type="finish")
     
     final_output_tensor = None
     
-    # 构建通用 pipe 参数字典
+    # Build a common dictionary for pipe arguments
     pipe_kwargs = {
         "prompt": "", "negative_prompt": "", "cfg_scale": 1.0, "num_inference_steps": 1,
         "seed": seed, "tiled": tiled_vae, "is_full_block": False, "if_buffer": True,
         "kv_ratio": kv_ratio, "local_range": local_range, "color_fix": color_fix,
         "unload_dit": unload_dit, "fps": _fps, "tiled_dit": tiled_dit,
     }
-
+    
     if tiled_dit:
         N, H, W, C = frames.shape
-        progress(0.1, desc="正在初始化模型管线...")
-        pipe = init_pipeline(mode, _device, dtype)
+        progress(0.1, desc="Initializing model pipeline...")
+        pipe = init_pipeline(model, mode, _device, dtype)
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
         
         if mode == "tiny-long":
@@ -341,10 +353,10 @@ def run_flashvsr_integrated(
                     quality=10, output_path=temp_name, **pipe_kwargs
                 )
                 temp_videos.append(temp_name); del LQ_tile, input_tile; clean_vram()
-            
+                
             stitch_video_tiles(temp_videos, tile_coords, (W*scale, H*scale), scale, tile_overlap, output_path, _fps, quality, True)
             shutil.rmtree(local_temp_dir)
-        else: # 内存中拼接
+        else: # In-memory stitching
             num_aligned_frames = largest_8n1_leq(N + 4) - 4
             final_output_canvas, weight_sum_canvas = torch.zeros((num_aligned_frames, H*scale, W*scale, C), dtype=torch.float32), torch.zeros((num_aligned_frames, H*scale, W*scale, C), dtype=torch.float32)
             for i in tqdm(range(len(tile_coords)), desc="[FlashVSR] Processing tiles"):
@@ -365,11 +377,11 @@ def run_flashvsr_integrated(
                 del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile; clean_vram()
             weight_sum_canvas[weight_sum_canvas == 0] = 1.0
             final_output_tensor = final_output_canvas / weight_sum_canvas
-    else: # 非分块模式
-        progress(0.1, desc="正在初始化模型管线...")
-        pipe = init_pipeline(mode, _device, dtype)
-        log(f"正在处理 {frames.shape[0]} 帧...", message_type='info')
-        
+    else: # Non-tiled mode
+        progress(0.1, desc="Initializing model pipeline...")
+        pipe = init_pipeline(model, mode, _device, dtype)
+        log(f"Processing {frame_count} frames...", message_type='info')
+    
         th, tw, F = get_input_params(frames, scale)
         if mode == "tiny-long":
             LQ = input_tensor_generator(frames, _device, scale=scale, dtype=dtype)
@@ -387,68 +399,69 @@ def run_flashvsr_integrated(
             )
             final_output_tensor = tensor2video(video).cpu()
         del pipe; clean_vram()
-
+    
     if final_output_tensor is not None:
-        progress(0.9, desc="正在保存最终视频...")
-        save_video(final_output_tensor, output_path, fps=_fps, quality=quality)
+        progress(0.9, desc="Saving final video...")
+        save_video(final_output_tensor[:frame_count, :, :, :], output_path, fps=_fps, quality=quality)
         
-    log(f"处理完成！输出视频已保存至: {output_path}", message_type="finish")
-    progress(1, desc="完成！")
+    log(f"Processing complete! Output video saved to: {output_path}", message_type="finish")
+    progress(1, desc="Done!")
     return output_path
 
 def create_ui():
     with gr.Blocks(theme=gr.themes.Soft(), title="FlashVSR+ WebUI") as demo:
         gr.Markdown("### FlashVSR+ WebUI")
-
+        
         with gr.Row():
             with gr.Column(scale=1):
-                input_video = gr.Video(label="上传视频文件", height=412)
-                run_button = gr.Button("开始处理", variant="primary")
-                gr.Markdown("### 主要设置")
+                input_video = gr.Video(label="Upload Video File", height=412)
+                run_button = gr.Button("Start Processing", variant="primary")
+                gr.Markdown("### Main Settings")
                 with gr.Group():
                     with gr.Row():
-                        mode_radio = gr.Radio(choices=["tiny", "tiny-long", "full"], value="tiny", label="处理模式 (Pipeline Mode)")
-                        seed_number = gr.Number(value=-1, label="随机种子 (Seed)", precision=0)
+                        mode_radio = gr.Radio(choices=["tiny", "tiny-long", "full"], value="tiny", label="Pipeline Mode")
+                        seed_number = gr.Number(value=-1, label="Seed", precision=0)
                 with gr.Group():
                     with gr.Row():
-                        scale_slider = gr.Slider(minimum=2, maximum=4, step=1, value=4, label="放大倍数 (Upscale Factor)")
-                        tiled_dit_checkbox = gr.Checkbox(label="启用分块推理 (Tiled DiT)", info="适用于超大分辨率视频或显存不足的情况", value=False)
+                        scale_slider = gr.Slider(minimum=2, maximum=4, step=1, value=4, label="Upscale Factor")
+                        tiled_dit_checkbox = gr.Checkbox(label="Enable Tiled DiT", info="For very high-resolution videos or low VRAM scenarios", value=False)
                     with gr.Row(visible=False) as tiled_dit_options:
-                        tile_size_slider = gr.Slider(minimum=64, maximum=512, step=16, value=256, label="分块大小 (Tile Size)")
-                        tile_overlap_slider = gr.Slider(minimum=8, maximum=128, step=8, value=24, label="重叠区域 (Tile Overlap)")
-
+                        tile_size_slider = gr.Slider(minimum=64, maximum=512, step=16, value=256, label="Tile Size")
+                        tile_overlap_slider = gr.Slider(minimum=8, maximum=128, step=8, value=24, label="Tile Overlap")
+                        
             with gr.Column(scale=1):
-                video_output = gr.Video(label="输出结果", interactive=False, height=620)
-                gr.Markdown("### 高级设置")
-                with gr.Accordion("展开高级选项", open=False):
-                    sparse_ratio_slider = gr.Slider(minimum=0.5, maximum=5.0, step=0.1, value=2.0, label="稀疏率 (Sparse Ratio)", info="控制注意力稀疏程度，值越小越稀疏")
-                    kv_ratio_slider = gr.Slider(minimum=1, maximum=8, step=1, value=3, label="KV 缓存比率 (KV Ratio)", info="控制KV缓存长度")
-                    local_range_slider = gr.Slider(minimum=3, maximum=15, step=2, value=11, label="局部范围 (Local Range)", info="局部注意力窗口大小")
-                    attention_mode_radio = gr.Radio(choices=["sage", "block"], value="sage", label="注意力模式 (Attention Mode)")
-                    color_fix_checkbox = gr.Checkbox(label="启用色彩校正 (Color Fix)", value=True)
-                    tiled_vae_checkbox = gr.Checkbox(label="启用分块 VAE (Tiled VAE)", value=True)
-                    unload_dit_checkbox = gr.Checkbox(label="解码前卸载 DiT (节省显存)", value=False)
-                    dtype_radio = gr.Radio(choices=["fp16", "bf16"], value="bf16", label="数据类型 (Data Type)")
-                    device_textbox = gr.Textbox(value="auto", label="运行设备 (Device)", info="例如: 'auto', 'cuda:0', 'cpu'")
-                    quality_slider = gr.Slider(minimum=1, maximum=10, step=1, value=6, label="输出视频质量 (Quality)")
-                    fps_number = gr.Number(value=30, label="输出帧率 (仅对图片序列输入有效)", precision=0)
-
+                video_output = gr.Video(label="Output Result", interactive=False, height=620)
+                gr.Markdown("### Advanced Settings")
+                with gr.Accordion("Expand Advanced Options", open=False):
+                    model_version = gr.Radio(choices=["FlashVSR", "FlashVSR-v1.1"], value="FlashVSR-v1.1", label="Model Version")
+                    sparse_ratio_slider = gr.Slider(minimum=0.5, maximum=5.0, step=0.1, value=2.0, label="Sparse Ratio", info="Controls attention sparsity; smaller values are more sparse")
+                    kv_ratio_slider = gr.Slider(minimum=1, maximum=8, step=1, value=3, label="KV Cache Ratio", info="Controls the length of the KV cache")
+                    local_range_slider = gr.Slider(minimum=3, maximum=15, step=2, value=11, label="Local Range", info="Size of the local attention window")
+                    attention_mode_radio = gr.Radio(choices=["sage", "block"], value="sage", label="Attention Mode")
+                    color_fix_checkbox = gr.Checkbox(label="Enable Color Fix", value=True)
+                    tiled_vae_checkbox = gr.Checkbox(label="Enable Tiled VAE", value=True)
+                    unload_dit_checkbox = gr.Checkbox(label="Unload DiT before decoding (saves VRAM)", value=False)
+                    dtype_radio = gr.Radio(choices=["fp16", "bf16"], value="bf16", label="Data Type")
+                    device_textbox = gr.Textbox(value="auto", label="Device", info="e.g., 'auto', 'cuda:0', 'cpu'")
+                    quality_slider = gr.Slider(minimum=1, maximum=10, step=1, value=6, label="Output Video Quality")
+                    fps_number = gr.Number(value=30, label="Output FPS (for image sequence input only)", precision=0)
+                    
         def toggle_tiled_dit_options(is_checked):
             return gr.update(visible=is_checked)
         
         tiled_dit_checkbox.change(fn=toggle_tiled_dit_options, inputs=[tiled_dit_checkbox], outputs=[tiled_dit_options])
-
+        
         run_button.click(
             fn=run_flashvsr_integrated,
             inputs=[
-                input_video, mode_radio, scale_slider, color_fix_checkbox, tiled_vae_checkbox, 
+                input_video, model_version, mode_radio, scale_slider, color_fix_checkbox, tiled_vae_checkbox, 
                 tiled_dit_checkbox, tile_size_slider, tile_overlap_slider, unload_dit_checkbox, 
                 dtype_radio, seed_number, device_textbox, fps_number, quality_slider, attention_mode_radio,
-                sparse_ratio_slider, kv_ratio_slider, local_range_slider # 添加新参数
+                sparse_ratio_slider, kv_ratio_slider, local_range_slider # Added new parameters
             ],
             outputs=[video_output]
         )
-
+        
     return demo
 
 if __name__ == "__main__":
