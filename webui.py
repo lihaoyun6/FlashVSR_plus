@@ -311,7 +311,7 @@ def run_flashvsr_integrated(
     
     # --- Core Logic ---
     progress(0, desc="Loading video frames...")
-    log(f"Loading frames from {input_path}...", message_type='info')
+    log(f"Loading frames from {os.path.basename(input_path)}...", message_type='info')
     _frames, original_fps = prepare_tensors(input_path, dtype=dtype)
     _fps = original_fps if is_video(input_path) else fps_override
     add = next_8n5(_frames.shape[0]) - _frames.shape[0]
