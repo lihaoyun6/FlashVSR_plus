@@ -512,7 +512,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
     
     add = next_8n5(_frames.shape[0]) - _frames.shape[0]
     padding_frames = _frames[-1:, :, :, :].repeat(add, 1, 1, 1)
-    frames = torch.cat([frames, padding_frames], dim=0)
+    frames = torch.cat([_frames, padding_frames], dim=0)
     frame_count = _frames.shape[0]
     del _frames
     clean_vram()
