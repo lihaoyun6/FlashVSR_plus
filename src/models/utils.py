@@ -194,7 +194,7 @@ def clean_vram():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-    if torch.mps.is_available():
+    if torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
 def get_device_list():
@@ -205,7 +205,7 @@ def get_device_list():
     except Exception:
         pass
     try:
-        if hasattr(torch, "mps") and hasattr(torch.mps, "is_available") and torch.mps.is_available():
+        if hasattr(torch, "mps") and hasattr(torch.mps, "is_available") and torch.backends.mps.is_available():
             devs += [f"mps:{i}" for i in range(torch.mps.device_count())]
     except Exception:
         pass
